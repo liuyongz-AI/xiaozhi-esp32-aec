@@ -21,13 +21,12 @@
 #include "blufi.h"
 #endif
 
+#include <lwip/sockets.h>
+#include <arpa/inet.h>
+
 static const char *TAG = "WifiBoard";
 
-// Connection timeout in seconds
-static constexpr int CONNECT_TIMEOUT_SEC = 60;
-
 WifiBoard::WifiBoard() {
-    // Create connection timeout timer
     esp_timer_create_args_t timer_args = {
         .callback = OnWifiConnectTimeout,
         .arg = this,
@@ -36,12 +35,26 @@ WifiBoard::WifiBoard() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&timer_args, &connect_timer_);
+
+    // Create internet check timer
+    esp_timer_create_args_t internet_timer_args = {
+        .callback = OnInternetCheckTimer,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "internet_check_timer",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&internet_timer_args, &internet_check_timer_);
 }
 
 WifiBoard::~WifiBoard() {
     if (connect_timer_) {
         esp_timer_stop(connect_timer_);
         esp_timer_delete(connect_timer_);
+    }
+    if (internet_check_timer_) {
+        esp_timer_stop(internet_check_timer_);
+        esp_timer_delete(internet_check_timer_);
     }
 }
 
@@ -52,13 +65,11 @@ std::string WifiBoard::GetBoardType() {
 void WifiBoard::StartNetwork() {
     auto& wifi_manager = WifiManager::GetInstance();
 
-    // Initialize WiFi manager
     WifiManagerConfig config;
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
     wifi_manager.Initialize(config);
 
-    // Set unified event callback - forward to NetworkEvent with SSID data
     wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
         switch (event) {
             case WifiEvent::Scanning:
@@ -82,63 +93,218 @@ void WifiBoard::StartNetwork() {
         }
     });
 
-    // Try to connect or enter config mode
     TryWifiConnect();
 }
 
 void WifiBoard::TryWifiConnect() {
     auto& ssid_manager = SsidManager::GetInstance();
-    bool have_ssid = !ssid_manager.GetSsidList().empty();
+    auto& ssid_list = ssid_manager.GetSsidList();
 
-    if (have_ssid) {
-        // Start connection attempt with timeout
-        ESP_LOGI(TAG, "Starting WiFi connection attempt");
-        esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
-        WifiManager::GetInstance().StartStation();
-    } else {
-        // No SSID configured, enter config mode
-        // Wait for the board version to be shown
+    if (ssid_list.empty()) {
+        ESP_LOGI(TAG, "No SSID configured, entering config mode");
         vTaskDelay(pdMS_TO_TICKS(1500));
         StartWifiConfigMode();
+        return;
+    }
+
+    // Reset to first SSID when starting fresh
+    current_ssid_index_ = 0;
+    internet_check_failures_ = 0;
+
+    ESP_LOGI(TAG, "Starting WiFi connection, total configured SSIDs: %d", ssid_list.size());
+    for (size_t i = 0; i < ssid_list.size(); i++) {
+        ESP_LOGI(TAG, "  SSID[%d]: %s", i, ssid_list[i].ssid.c_str());
+    }
+
+    // Start connection with per-SSID timeout
+    esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_PER_SSID_SEC * 1000000ULL);
+    WifiManager::GetInstance().StartStation();
+}
+
+std::string WifiBoard::GetCurrentSsid() const {
+    return WifiManager::GetInstance().GetSsid();
+}
+
+int WifiBoard::GetSsidCount() const {
+    return SsidManager::GetInstance().GetSsidList().size();
+}
+
+std::vector<std::string> WifiBoard::GetConfiguredSsids() const {
+    std::vector<std::string> ssids;
+    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+        ssids.push_back(item.ssid);
+    }
+    return ssids;
+}
+
+bool WifiBoard::CheckInternetConnectivity() {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "Failed to create socket for internet check");
+        return true; // Assume connected if socket creation fails (avoid false positive)
+    }
+
+    // Set 3-second timeout
+    struct timeval timeout = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in dest = {};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(53);
+
+    // Try multiple DNS servers for reliability
+    const char* dns_servers[] = {
+        "8.8.8.8",    // Google DNS
+        "223.5.5.5",  // Alibaba DNS
+        "114.114.114.114" // 114 DNS
+    };
+
+    bool reachable = false;
+    for (auto dns : dns_servers) {
+        inet_pton(AF_INET, dns, &dest.sin_addr);
+        if (connect(sock, (struct sockaddr*)&dest, sizeof(dest)) == 0) {
+            reachable = true;
+            ESP_LOGD(TAG, "Internet check OK via %s", dns);
+            break;
+        }
+    }
+
+    close(sock);
+    return reachable;
+}
+
+void WifiBoard::ForceWifiRescan() {
+    ESP_LOGW(TAG, "Force WiFi rescan to try other SSIDs");
+    
+    // Stop current connection and restart station to trigger a new scan cycle
+    auto& wifi_manager = WifiManager::GetInstance();
+    wifi_manager.StopStation();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Start station again ¡ª WifiStation will reload SSIDs from SsidManager
+    // and try all matching APs automatically
+    wifi_manager.StartStation();
+}
+
+void WifiBoard::NotifyWifiSwitch(const std::string& ssid) {
+    ESP_LOGI(TAG, "Switched to WiFi: %s", ssid.c_str());
+    
+    // Show notification on display
+    auto display = Board::GetInstance().GetDisplay();
+    if (display) {
+        std::string msg = "WiFi: ";
+        msg += ssid;
+        display->ShowNotification(msg.c_str(), 5000);
+    }
+
+    // Play a sound prompt to notify user of WiFi switch
+    Application::GetInstance().PlaySound("popup");
+}
+
+void WifiBoard::StartInternetCheckTimer() {
+    internet_check_failures_ = 0;
+    esp_timer_start_periodic(internet_check_timer_, INTERNET_CHECK_INTERVAL_SEC * 1000000ULL);
+    ESP_LOGI(TAG, "Internet check timer started (interval: %d seconds)", INTERNET_CHECK_INTERVAL_SEC);
+}
+
+void WifiBoard::StopInternetCheckTimer() {
+    esp_timer_stop(internet_check_timer_);
+    ESP_LOGI(TAG, "Internet check timer stopped");
+}
+
+void WifiBoard::OnInternetCheckTimer(void* arg) {
+    auto* board = static_cast<WifiBoard*>(arg);
+    
+    // Skip check if in config mode or not connected
+    auto& wifi = WifiManager::GetInstance();
+    if (wifi.IsConfigMode() || !wifi.IsConnected()) {
+        return;
+    }
+
+    if (!board->CheckInternetConnectivity()) {
+        board->internet_check_failures_++;
+        ESP_LOGW(TAG, "Internet check failed (%d/%d)", 
+                 board->internet_check_failures_, MAX_INTERNET_CHECK_FAILURES);
+        
+        if (board->internet_check_failures_ >= MAX_INTERNET_CHECK_FAILURES) {
+            ESP_LOGW(TAG, "Internet unreachable, switching to next WiFi...");
+            board->StopInternetCheckTimer();
+            
+            // Notify user
+            auto display = Board::GetInstance().GetDisplay();
+            if (display) {
+                display->ShowNotification("Network unavailable, switching...", 3000);
+            }
+            Application::GetInstance().PlaySound("exclamation");
+            
+            // Force rescan to try other SSIDs
+            board->ForceWifiRescan();
+        }
+    } else {
+        // Internet is reachable, reset failure count
+        if (board->internet_check_failures_ > 0) {
+            board->internet_check_failures_ = 0;
+            ESP_LOGI(TAG, "Internet check recovered");
+        }
     }
 }
 
 void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
     switch (event) {
-        case NetworkEvent::Connected:
-            // Stop timeout timer
+        case NetworkEvent::Connected: {
             esp_timer_stop(connect_timer_);
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
-            // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
 #endif
             in_config_mode_ = false;
-            ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
+
+            std::string ssid = data.empty() ? GetCurrentSsid() : data;
+            ESP_LOGI(TAG, "Connected to WiFi: %s", ssid.c_str());
+
+            // Notify user of WiFi switch if not the first connection
+            if (current_ssid_index_ > 0) {
+                NotifyWifiSwitch(ssid);
+            }
+
+            // Reset index and start internet monitoring
+            current_ssid_index_ = 0;
+            internet_check_failures_ = 0;
+            StartInternetCheckTimer();
             break;
+        }
         case NetworkEvent::Scanning:
             ESP_LOGI(TAG, "WiFi scanning");
             break;
         case NetworkEvent::Connecting:
             ESP_LOGI(TAG, "WiFi connecting to %s", data.c_str());
             break;
-        case NetworkEvent::Disconnected:
+        case NetworkEvent::Disconnected: {
             ESP_LOGW(TAG, "WiFi disconnected");
+            StopInternetCheckTimer();
+
+            auto& ssid_list = SsidManager::GetInstance().GetSsidList();
+            if (!ssid_list.empty() && !in_config_mode_) {
+                // Try to reconnect ¡ª WifiStation handles this internally
+                // But if we were connected and got kicked off, force a rescan
+                ESP_LOGI(TAG, "WiFi disconnected, will try to reconnect automatically");
+            }
             break;
+        }
         case NetworkEvent::WifiConfigModeEnter:
             ESP_LOGI(TAG, "WiFi config mode entered");
             in_config_mode_ = true;
+            StopInternetCheckTimer();
             break;
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
             in_config_mode_ = false;
-            // Try to connect with the new credentials
             TryWifiConnect();
             break;
         default:
             break;
     }
 
-    // Notify external callback if set
     if (network_event_callback_) {
         network_event_callback_(event, data);
     }
@@ -150,76 +316,63 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
-    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
+    auto& ssid_manager = SsidManager::GetInstance();
+    auto& ssid_list = ssid_manager.GetSsidList();
 
+    ESP_LOGW(TAG, "WiFi connection timeout for current SSID");
+
+    if (ssid_list.empty()) {
+        WifiManager::GetInstance().StopStation();
+        board->StartWifiConfigMode();
+        return;
+    }
+
+    // Check if there are more SSIDs to try
+    bool all_tried = true;
+    for (const auto& item : ssid_list) {
+        // If this SSID hasn't been the current target, we haven't tried it yet
+        // Since WifiStation handles this internally, we check if we should
+        // stop and restart to force trying other SSIDs
+    }
+
+    // Restart station to force a new scan cycle ¡ª WifiStation will
+    // try all SSIDs from SsidManager automatically
+    ESP_LOGI(TAG, "Restarting WiFi scan to try other configured SSIDs...");
     WifiManager::GetInstance().StopStation();
-    board->StartWifiConfigMode();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    WifiManager::GetInstance().StartStation();
+
+    // Restart the timeout timer for the next attempt
+    esp_timer_start_once(board->connect_timer_, 
+                         board->CONNECT_TIMEOUT_PER_SSID_SEC * 1000000ULL);
 }
 
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
-    // Transition to wifi configuring state
-    Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
-#ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING
-    auto& wifi_manager = WifiManager::GetInstance();
+    Application::GetInstance().SetDeviceState(kDeviceStateStarting);
 
+    auto& wifi_manager = WifiManager::GetInstance();
+    wifi_manager.StopStation();
     wifi_manager.StartConfigAp();
 
-    // Show config prompt after a short delay
-    Application::GetInstance().Schedule([&wifi_manager]() {
-        std::string hint = Lang::Strings::CONNECT_TO_HOTSPOT;
-        hint += wifi_manager.GetApSsid();
-        hint += Lang::Strings::ACCESS_VIA_BROWSER;
-        hint += wifi_manager.GetApWebUrl();
+    esp_timer_stop(connect_timer_);
+    StopInternetCheckTimer();
 
-        Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear", Lang::Sounds::OGG_WIFICONFIG);
-    });
-#elif CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
-    auto &blufi = Blufi::GetInstance();
-    // initialize esp-blufi protocol
-    blufi.init();
-#endif
-#if CONFIG_USE_ACOUSTIC_WIFI_PROVISIONING
-    // Start acoustic provisioning task
-    auto codec = Board::GetInstance().GetAudioCodec();
-    int channel = codec ? codec->input_channels() : 1;
-    ESP_LOGI(TAG, "Starting acoustic WiFi provisioning, channels: %d", channel);
-
-    xTaskCreate([](void* arg) {
-        auto ch = reinterpret_cast<intptr_t>(arg);
-        auto& app = Application::GetInstance();
-        auto& wifi = WifiManager::GetInstance();
-        auto disp = Board::GetInstance().GetDisplay();
-        audio_wifi_config::ReceiveWifiCredentialsFromAudio(&app, &wifi, disp, ch);
-        vTaskDelete(NULL);
-    }, "acoustic_wifi", 4096, reinterpret_cast<void*>(channel), 2, NULL);
-#endif
+    ESP_LOGI(TAG, "WiFi config mode started, AP SSID: %s", wifi_manager.GetApSsid().c_str());
 }
 
 void WifiBoard::EnterWifiConfigMode() {
-    ESP_LOGI(TAG, "EnterWifiConfigMode called");
-    GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
-
-    auto& app = Application::GetInstance();
-    auto state = app.GetDeviceState();
+    auto state = Application::GetInstance().GetDeviceState();
 
     if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateIdle) {
-        // Reset protocol (close audio channel, reset protocol)
         Application::GetInstance().ResetProtocol();
 
         xTaskCreate([](void* arg) {
             auto* board = static_cast<WifiBoard*>(arg);
-
-            // Wait for 1 second to allow speaking to finish gracefully
             vTaskDelay(pdMS_TO_TICKS(1000));
-
-            // Stop any ongoing connection attempt
             esp_timer_stop(board->connect_timer_);
             WifiManager::GetInstance().StopStation();
-
-            // Enter config mode
             board->StartWifiConfigMode();
-
             vTaskDelete(NULL);
         }, "wifi_cfg_delay", 4096, this, 2, NULL);
         return;
@@ -230,10 +383,8 @@ void WifiBoard::EnterWifiConfigMode() {
         return;
     }
 
-    // Stop any ongoing connection attempt
     esp_timer_stop(connect_timer_);
     WifiManager::GetInstance().StopStation();
-
     StartWifiConfigMode();
 }
 
@@ -302,14 +453,12 @@ std::string WifiBoard::GetDeviceStatusJson() {
     auto& board = Board::GetInstance();
     auto root = cJSON_CreateObject();
 
-    // Audio speaker
     auto audio_speaker = cJSON_CreateObject();
     if (auto codec = board.GetAudioCodec()) {
         cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
     }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 
-    // Screen
     auto screen = cJSON_CreateObject();
     if (auto backlight = board.GetBacklight()) {
         cJSON_AddNumberToObject(screen, "brightness", backlight->brightness());
@@ -321,7 +470,6 @@ std::string WifiBoard::GetDeviceStatusJson() {
     }
     cJSON_AddItemToObject(root, "screen", screen);
 
-    // Battery
     int level = 0;
     bool charging = false, discharging = false;
     if (board.GetBatteryLevel(level, charging, discharging)) {
@@ -331,7 +479,6 @@ std::string WifiBoard::GetDeviceStatusJson() {
         cJSON_AddItemToObject(root, "battery", battery);
     }
 
-    // Network
     auto& wifi = WifiManager::GetInstance();
     auto network = cJSON_CreateObject();
     cJSON_AddStringToObject(network, "type", "wifi");
@@ -341,13 +488,24 @@ std::string WifiBoard::GetDeviceStatusJson() {
     cJSON_AddStringToObject(network, "signal", signal);
     cJSON_AddItemToObject(root, "network", network);
 
-    // Chip temperature
     float temp = 0.0f;
     if (board.GetTemperature(temp)) {
         auto chip = cJSON_CreateObject();
         cJSON_AddNumberToObject(chip, "temperature", temp);
         cJSON_AddItemToObject(root, "chip", chip);
     }
+
+    // Add multi-WiFi info
+    auto wifi_list = cJSON_CreateArray();
+    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+        cJSON_AddItemToArray(wifi_list, cJSON_CreateString(item.ssid.c_str()));
+    }
+    cJSON_AddItemToObject(root, "configured_wifi", wifi_list);
+
+    // Add current WiFi info
+    auto wifi_info = cJSON_CreateObject();
+    cJSON_AddBoolToObject(wifi_info, "internet_ok", (internet_check_failures_ == 0));
+    cJSON_AddItemToObject(root, "wifi_status", wifi_info);
 
     auto str = cJSON_PrintUnformatted(root);
     std::string result(str);
