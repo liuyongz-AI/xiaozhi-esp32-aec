@@ -1,0 +1,9 @@
+build/
+sdkconfig
+*.bin
+*.elf
+**/managed_components/
+__pycache__/
+*.pyc
+.vscode/
+*.swp

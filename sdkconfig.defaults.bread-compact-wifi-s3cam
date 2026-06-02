@@ -1,0 +1,7 @@
+﻿# Board type: Bread Compact WiFi + LCD + Camera
+CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_CAM=y
+# LCD: ST7789 1.54 inch 240x240
+CONFIG_LCD_ST7789_240X240=y
+
+# Enable server-side AEC for voice interruption
+CONFIG_USE_SERVER_AEC=y
